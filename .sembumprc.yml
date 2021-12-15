@@ -8,8 +8,8 @@ commit_filters:
   - all
 version_name_with_date: true 
 version_name_with_author: true
-issue_uri_format: https://github.com/sandwich-go/xlistener/issues/%s
-commit_uri_format: https://github.com/sandwich-go/xlistener/commit/%s 
+issue_uri_format: https://github.com/sandwich-go/%s/issues/%s
+commit_uri_format: https://github.com/sandwich-go/%s/commit/%s 
 merge_duplicate_commit: true
 commit_with_author_at_date: true
 short_hash_len: 7 
