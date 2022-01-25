@@ -6,36 +6,55 @@ package xlistener
 import (
 	"fmt"
 	"os"
+	"sync/atomic"
 	"time"
+	"unsafe"
 )
 
-var _ = ConfOptionDeclareWithDefault()
-
+// Conf should use NewConf to initialize it
 type Conf struct {
-	BacklogAccept    int
-	TimeoutCanRead   time.Duration
-	EnableHandshake  bool
-	HandshakeTimeout time.Duration
-	Debugf           func(format string, v ...interface{})
-	Warningf         func(format string, v ...interface{})
+	// annotation@BacklogAccept(comment="like Linux TCP backlog")
+	BacklogAccept int `xconf:"backlog_accept" usage:"like Linux TCP backlog"`
+	// annotation@TimeoutCanRead(comment="conn will be closed if no data arrived after TimeoutCanRead since conn established")
+	TimeoutCanRead time.Duration `xconf:"timeout_can_read" usage:"conn will be closed if no data arrived after TimeoutCanRead since conn established"`
+	// annotation@EnableHandshake(comment="enable handler shake between server and client")
+	EnableHandshake bool `xconf:"enable_handshake" usage:"enable handler shake between server and client"`
+	// annotation@HandshakeTimeout(comment="if can not finish Handshake withen HandshakeTimeout, conn will be closed")
+	HandshakeTimeout time.Duration `xconf:"handshake_timeout" usage:"if can not finish Handshake withen HandshakeTimeout, conn will be closed"`
+	// annotation@Debugf(comment="debug log func")
+	Debugf func(format string, v ...interface{}) `xconf:"debugf" usage:"debug log func"`
+	// annotation@Warningf(comment="warn log func")
+	Warningf func(format string, v ...interface{}) `xconf:"warningf" usage:"warn log func"`
 }
 
-func (cc *Conf) SetOption(opt ConfOption) {
-	_ = opt(cc)
-}
-
-func (cc *Conf) ApplyOption(opts ...ConfOption) {
+// NewConf new Conf
+func NewConf(opts ...ConfOption) *Conf {
+	cc := newDefaultConf()
 	for _, opt := range opts {
-		_ = opt(cc)
+		opt(cc)
 	}
+	if watchDogConf != nil {
+		watchDogConf(cc)
+	}
+	return cc
 }
 
-func (cc *Conf) GetSetOption(opt ConfOption) ConfOption {
-	return opt(cc)
+// ApplyOption apply mutiple new option and return the old ones
+// sample:
+// old := cc.ApplyOption(WithTimeout(time.Second))
+// defer cc.ApplyOption(old...)
+func (cc *Conf) ApplyOption(opts ...ConfOption) []ConfOption {
+	var previous []ConfOption
+	for _, opt := range opts {
+		previous = append(previous, opt(cc))
+	}
+	return previous
 }
 
+// ConfOption option func
 type ConfOption func(cc *Conf) ConfOption
 
+// WithBacklogAccept like Linux TCP backlog
 func WithBacklogAccept(v int) ConfOption {
 	return func(cc *Conf) ConfOption {
 		previous := cc.BacklogAccept
@@ -44,6 +63,7 @@ func WithBacklogAccept(v int) ConfOption {
 	}
 }
 
+// WithTimeoutCanRead conn will be closed if no data arrived after TimeoutCanRead since conn established
 func WithTimeoutCanRead(v time.Duration) ConfOption {
 	return func(cc *Conf) ConfOption {
 		previous := cc.TimeoutCanRead
@@ -52,6 +72,7 @@ func WithTimeoutCanRead(v time.Duration) ConfOption {
 	}
 }
 
+// WithEnableHandshake enable handler shake between server and client
 func WithEnableHandshake(v bool) ConfOption {
 	return func(cc *Conf) ConfOption {
 		previous := cc.EnableHandshake
@@ -60,6 +81,7 @@ func WithEnableHandshake(v bool) ConfOption {
 	}
 }
 
+// WithHandshakeTimeout if can not finish Handshake withen HandshakeTimeout, conn will be closed
 func WithHandshakeTimeout(v time.Duration) ConfOption {
 	return func(cc *Conf) ConfOption {
 		previous := cc.HandshakeTimeout
@@ -68,6 +90,7 @@ func WithHandshakeTimeout(v time.Duration) ConfOption {
 	}
 }
 
+// WithDebugf debug log func
 func WithDebugf(v func(format string, v ...interface{})) ConfOption {
 	return func(cc *Conf) ConfOption {
 		previous := cc.Debugf
@@ -76,6 +99,7 @@ func WithDebugf(v func(format string, v ...interface{})) ConfOption {
 	}
 }
 
+// WithWarningf warn log func
 func WithWarningf(v func(format string, v ...interface{})) ConfOption {
 	return func(cc *Conf) ConfOption {
 		previous := cc.Warningf
@@ -84,25 +108,14 @@ func WithWarningf(v func(format string, v ...interface{})) ConfOption {
 	}
 }
 
-func NewConf(opts ...ConfOption) *Conf {
-	cc := newDefaultConf()
-	for _, opt := range opts {
-		_ = opt(cc)
-	}
-	if watchDogConf != nil {
-		watchDogConf(cc)
-	}
-	return cc
-}
+// InstallConfWatchDog the installed func will called when NewConf  called
+func InstallConfWatchDog(dog func(cc *Conf)) { watchDogConf = dog }
 
-func InstallConfWatchDog(dog func(cc *Conf)) {
-	watchDogConf = dog
-}
-
+// watchDogConf global watch dog
 var watchDogConf func(cc *Conf)
 
+// newDefaultConf new default Conf
 func newDefaultConf() *Conf {
-
 	cc := &Conf{}
 
 	for _, opt := range [...]ConfOption{
@@ -111,14 +124,75 @@ func newDefaultConf() *Conf {
 		WithEnableHandshake(false),
 		WithHandshakeTimeout(time.Second * time.Duration(10)),
 		WithDebugf(func(format string, v ...interface{}) {
-			_, _ = fmt.Fprintf(os.Stdout, format, v...)
+			fmt.Fprintf(os.Stdout, format, v...)
 		}),
 		WithWarningf(func(format string, v ...interface{}) {
-			_, _ = fmt.Fprintf(os.Stderr, format, v...)
+			fmt.Fprintf(os.Stderr, format, v...)
 		}),
 	} {
-		_ = opt(cc)
+		opt(cc)
 	}
 
 	return cc
+}
+
+// AtomicSetFunc used for XConf
+func (cc *Conf) AtomicSetFunc() func(interface{}) { return AtomicConfSet }
+
+// atomicConf global *Conf holder
+var atomicConf unsafe.Pointer
+
+// onAtomicConfSet global call back when  AtomicConfSet called by XConf.
+// use ConfInterface.ApplyOption to modify the updated cc
+// if passed in cc not valid, then return false, cc will not set to atomicConf
+var onAtomicConfSet func(cc ConfInterface) bool
+
+// InstallCallbackOnAtomicConfSet install callback
+func InstallCallbackOnAtomicConfSet(callback func(cc ConfInterface) bool) { onAtomicConfSet = callback }
+
+// AtomicConfSet atomic setter for *Conf
+func AtomicConfSet(update interface{}) {
+	cc := update.(*Conf)
+	if onAtomicConfSet != nil && !onAtomicConfSet(cc) {
+		return
+	}
+	atomic.StorePointer(&atomicConf, (unsafe.Pointer)(cc))
+}
+
+// AtomicConf return atomic *ConfVisitor
+func AtomicConf() ConfVisitor {
+	current := (*Conf)(atomic.LoadPointer(&atomicConf))
+	if current == nil {
+		defaultOne := newDefaultConf()
+		if watchDogConf != nil {
+			watchDogConf(defaultOne)
+		}
+		atomic.CompareAndSwapPointer(&atomicConf, nil, (unsafe.Pointer)(defaultOne))
+		return (*Conf)(atomic.LoadPointer(&atomicConf))
+	}
+	return current
+}
+
+// all getter func
+func (cc *Conf) GetBacklogAccept() int                              { return cc.BacklogAccept }
+func (cc *Conf) GetTimeoutCanRead() time.Duration                   { return cc.TimeoutCanRead }
+func (cc *Conf) GetEnableHandshake() bool                           { return cc.EnableHandshake }
+func (cc *Conf) GetHandshakeTimeout() time.Duration                 { return cc.HandshakeTimeout }
+func (cc *Conf) GetDebugf() func(format string, v ...interface{})   { return cc.Debugf }
+func (cc *Conf) GetWarningf() func(format string, v ...interface{}) { return cc.Warningf }
+
+// ConfVisitor visitor interface for Conf
+type ConfVisitor interface {
+	GetBacklogAccept() int
+	GetTimeoutCanRead() time.Duration
+	GetEnableHandshake() bool
+	GetHandshakeTimeout() time.Duration
+	GetDebugf() func(format string, v ...interface{})
+	GetWarningf() func(format string, v ...interface{})
+}
+
+// ConfInterface visitor + ApplyOption interface for Conf
+type ConfInterface interface {
+	ConfVisitor
+	ApplyOption(...ConfOption) []ConfOption
 }
