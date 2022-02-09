@@ -151,7 +151,7 @@ func (m *IntFdInfo) LockFunc(f func(data map[int]*fdInfo)) {
 	for _, shard := range m.shardedList {
 		shard.Lock()
 		f(shard.items)
-		shard.RLock()
+		shard.Unlock()
 	}
 }
 
@@ -168,6 +168,7 @@ func (m *IntFdInfo) doSetWithLockCheck(key int, val *fdInfo) (result *fdInfo, is
 	shard.Lock()
 
 	if got, ok := shard.items[key]; ok {
+		shard.Unlock()
 		return got, false
 	}
 
@@ -182,6 +183,7 @@ func (m *IntFdInfo) doSetWithLockCheckWithFunc(key int, f func(key int) *fdInfo)
 	shard.Lock()
 
 	if got, ok := shard.items[key]; ok {
+		shard.Unlock()
 		return got, false
 	}
 
