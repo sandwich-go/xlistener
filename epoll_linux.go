@@ -175,7 +175,7 @@ func (ep *epoll) wait(onError func(error)) {
 		now = time.Now()
 		nowUnix = now.Unix()
 		if timeLastCheckTimeout.Add(ep.timeoutSigRead).Before(now) {
-			var delKeys []string
+			var delKeys []int
 			for info := range ep.callbacks.Iter() {
 				if info.Val != nil && info.Val.tsTimeout < nowUnix {
 					delKeys = append(delKeys, info.Key)
