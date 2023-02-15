@@ -46,18 +46,19 @@ func NewIntFdInfo() *IntFdInfo {
 	return NewWithSharedCountIntFdInfo(DefaultShardCountIntFdInfo)
 }
 
-// GetShard Returns shard under given key.
+// GetShard 返回key对应的分片
 func (m *IntFdInfo) GetShard(key int) *shardedIntFdInfo {
 	return m.shardedList[func(k int) uint64 {
 		return uint64(k)
 	}(key)%m.shardedCount]
 }
 
-// IsEmpty checks if map is empty.
+// IsEmpty 返回容器是否为空
 func (m *IntFdInfo) IsEmpty() bool {
 	return m.Count() == 0
 }
 
+// Set 设定元素
 func (m *IntFdInfo) Set(key int, value *fdInfo) {
 	shard := m.GetShard(key)
 	shard.Lock()
@@ -65,7 +66,7 @@ func (m *IntFdInfo) Set(key int, value *fdInfo) {
 	shard.Unlock()
 }
 
-// Keys get all keys
+// Keys 返回所有的key列表
 func (m *IntFdInfo) Keys() []int {
 	var ret []int
 	for _, shard := range m.shardedList {
@@ -78,21 +79,9 @@ func (m *IntFdInfo) Keys() []int {
 	return ret
 }
 
-// MGet multiple get by keys
-func (m *IntFdInfo) MGet(keys ...int) map[int]*fdInfo {
-	data := make(map[int]*fdInfo)
-	for _, key := range keys {
-		if val, ok := m.Get(key); ok {
-			data[key] = val
-		}
-	}
-	return data
-}
-
-// GetAll get all values
+// GetAll 返回所有元素副本，其中value浅拷贝
 func (m *IntFdInfo) GetAll() map[int]*fdInfo {
 	data := make(map[int]*fdInfo)
-
 	for _, shard := range m.shardedList {
 		shard.RLock()
 		for key, val := range shard.items {
@@ -103,7 +92,7 @@ func (m *IntFdInfo) GetAll() map[int]*fdInfo {
 	return data
 }
 
-// Clear all values
+// Clear 清空元素
 func (m *IntFdInfo) Clear() {
 	for _, shard := range m.shardedList {
 		shard.Lock()
@@ -112,42 +101,94 @@ func (m *IntFdInfo) Clear() {
 	}
 }
 
-// MSet multiple set
+// ClearWithFunc 清空元素,onClear在对应分片的Lock内执行，执行完毕后对容器做整体clear操作
+//
+// Note: 不要在onClear对当前容器做读写操作，容易死锁
+//
+// data.ClearWithFuncLock(func(key string,val string) {
+//		data.Get(...) // 死锁
+// })
+//
+func (m *IntFdInfo) ClearWithFuncLock(onClear func(key int, val *fdInfo)) {
+	for _, shard := range m.shardedList {
+		shard.Lock()
+		for key, val := range shard.items {
+			onClear(key, val)
+		}
+		shard.items = make(map[int]*fdInfo)
+		shard.Unlock()
+	}
+}
+
+// MGet 返回多个元素
+func (m *IntFdInfo) MGet(keys ...int) map[int]*fdInfo {
+	data := make(map[int]*fdInfo)
+	for _, key := range keys {
+		if val, ok := m.Get(key); ok {
+			data[key] = val
+		}
+	}
+	return data
+}
+
+// MSet 同时设定多个元素
 func (m *IntFdInfo) MSet(data map[int]*fdInfo) {
 	for key, value := range data {
 		m.Set(key, value)
 	}
 }
 
-// SetNX like redis SETNX
-// return true if the key was set
-// return false if the key was not set
-func (m *IntFdInfo) SetNX(key int, value *fdInfo) bool {
+// SetNX 如果key不存在，则设定为value, 设定成功则返回true，否则返回false
+func (m *IntFdInfo) SetNX(key int, value *fdInfo) (isSet bool) {
 	shard := m.GetShard(key)
 	shard.Lock()
-	_, ok := shard.items[key]
-	if !ok {
+	if _, ok := shard.items[key]; !ok {
 		shard.items[key] = value
+		isSet = true
 	}
 	shard.Unlock()
-	return true
+	return isSet
 }
 
-func (m *IntFdInfo) LockFuncWithKey(key int, f func(m map[int]*fdInfo)) {
+// LockFuncWithKey 对key对应的分片加写锁，并用f操作该分片内数据
+//
+// Note: 不要对f中对容器的该分片做读写操作，可以直接操作shardData数据源
+//
+//  data.LockFuncWithKey("test",func(shardData map[string]string) {
+//     data.Remove("test")      // 当前分片已被加读锁, 死锁
+//  })
+//
+func (m *IntFdInfo) LockFuncWithKey(key int, f func(shardData map[int]*fdInfo)) {
 	shard := m.GetShard(key)
 	shard.Lock()
 	defer shard.Unlock()
 	f(shard.items)
 }
 
-func (m *IntFdInfo) RLockFuncWithKey(key int, f func(m map[int]*fdInfo)) {
+// RLockFuncWithKey 对key对应的分片加读锁，并用f操作该分片内数据
+//
+// Note: 不要在f内对容器做写操作，否则会引起死锁，可以直接操作shardData数据源
+//
+//  data.RLockFuncWithKey("test",func(shardData map[string]string) {
+//     data.Remove("test")      // 当前分片已被加读锁, 死锁
+//  })
+//
+func (m *IntFdInfo) RLockFuncWithKey(key int, f func(shardData map[int]*fdInfo)) {
 	shard := m.GetShard(key)
 	shard.RLock()
 	defer shard.RUnlock()
 	f(shard.items)
 }
 
-func (m *IntFdInfo) LockFunc(f func(data map[int]*fdInfo)) {
+// LockFunc 遍历容器分片，f在Lock写锁内执行
+//
+// Note: 不要在f内对容器做读写操作，否则会引起死锁，可以直接操作shardData数据源
+//
+//  data.LockFunc(func(shardData map[string]string) {
+//     data.Count()             // 当前分片已被加写锁, 死锁
+//  })
+//
+func (m *IntFdInfo) LockFunc(f func(shardData map[int]*fdInfo)) {
 	for _, shard := range m.shardedList {
 		shard.Lock()
 		f(shard.items)
@@ -155,7 +196,15 @@ func (m *IntFdInfo) LockFunc(f func(data map[int]*fdInfo)) {
 	}
 }
 
-func (m *IntFdInfo) RLockFunc(f func(m map[int]*fdInfo)) {
+// RLockFunc 遍历容器分片，f在RLock读锁内执行
+//
+// Note: 不要在f内对容器做修改操作，否则会引起死锁，可以直接操作shardData数据源
+//
+//  data.RLockFunc(func(shardData map[string]string) {
+//     data.Remove("test")      // 当前分片已被加读锁, 死锁
+//  })
+//
+func (m *IntFdInfo) RLockFunc(f func(shardData map[int]*fdInfo)) {
 	for _, shard := range m.shardedList {
 		shard.RLock()
 		f(shard.items)
@@ -193,7 +242,7 @@ func (m *IntFdInfo) doSetWithLockCheckWithFunc(key int, f func(key int) *fdInfo)
 	return
 }
 
-// GetOrSetFunc 获取或者设定数值，f在lock外执行
+// GetOrSetFunc 获取或者设定数值，方法f在Lock写锁外执行, 如元素早已存在则返回false,设定成功返回true
 func (m *IntFdInfo) GetOrSetFunc(key int, f func(key int) *fdInfo) (result *fdInfo, isSet bool) {
 	if v, ok := m.Get(key); ok {
 		return v, false
@@ -201,7 +250,14 @@ func (m *IntFdInfo) GetOrSetFunc(key int, f func(key int) *fdInfo) (result *fdIn
 	return m.doSetWithLockCheck(key, f(key))
 }
 
-// GetOrSetFuncLock 获取或者设定数值，f在lock内执行
+// GetOrSetFuncLock 获取或者设定数值，方法f在Lock写锁内执行, 如元素早已存在则返回false,设定成功返回true
+//
+// Note: 不要在f内对容器做操作，否则会死锁
+//
+//  data.GetOrSetFuncLock(“test”,func(key string)string {
+//     data.Count() // 死锁
+//  })
+//
 func (m *IntFdInfo) GetOrSetFuncLock(key int, f func(key int) *fdInfo) (result *fdInfo, isSet bool) {
 	if v, ok := m.Get(key); ok {
 		return v, false
@@ -209,7 +265,7 @@ func (m *IntFdInfo) GetOrSetFuncLock(key int, f func(key int) *fdInfo) (result *
 	return m.doSetWithLockCheckWithFunc(key, f)
 }
 
-// GetOrSet 获取或设定元素
+// GetOrSet 获取或设定元素, 如元素早已存在则返回false,设定成功返回true
 func (m *IntFdInfo) GetOrSet(key int, val *fdInfo) (*fdInfo, bool) {
 	if v, ok := m.Get(key); ok {
 		return v, false
@@ -217,6 +273,7 @@ func (m *IntFdInfo) GetOrSet(key int, val *fdInfo) (*fdInfo, bool) {
 	return m.doSetWithLockCheck(key, val)
 }
 
+// Get 返回key对应的元素，不存在返回false
 func (m *IntFdInfo) Get(key int) (*fdInfo, bool) {
 	shard := m.GetShard(key)
 	shard.RLock()
@@ -225,8 +282,13 @@ func (m *IntFdInfo) Get(key int) (*fdInfo, bool) {
 	return val, ok
 }
 
-func (m *IntFdInfo) Len() int  { return m.Count() }
+// Len Count方法别名
+func (m *IntFdInfo) Len() int { return m.Count() }
+
+// Size Count方法别名
 func (m *IntFdInfo) Size() int { return m.Count() }
+
+// Count 返回容器内元素数量
 func (m *IntFdInfo) Count() int {
 	count := 0
 	for i := uint64(0); i < m.shardedCount; i++ {
@@ -238,6 +300,7 @@ func (m *IntFdInfo) Count() int {
 	return count
 }
 
+// Has 是否存在key对应的元素
 func (m *IntFdInfo) Has(key int) bool {
 	shard := m.GetShard(key)
 	shard.RLock()
@@ -246,6 +309,7 @@ func (m *IntFdInfo) Has(key int) bool {
 	return ok
 }
 
+// Remove 删除key对应的元素
 func (m *IntFdInfo) Remove(key int) {
 	shard := m.GetShard(key)
 	shard.Lock()
@@ -253,6 +317,7 @@ func (m *IntFdInfo) Remove(key int) {
 	shard.Unlock()
 }
 
+// GetAndRemove 返回key对应的元素并将其由容器中删除，如果元素不存在则返回false
 func (m *IntFdInfo) GetAndRemove(key int) (*fdInfo, bool) {
 	shard := m.GetShard(key)
 	shard.Lock()
@@ -262,12 +327,21 @@ func (m *IntFdInfo) GetAndRemove(key int) (*fdInfo, bool) {
 	return val, ok
 }
 
-// Iter Returns an iterator which could be used in a for range loop.
+// Iter 迭代当前容器内所有元素，使用无缓冲chan
+//
+// Note: 不要在迭代过程中对当前容器作修改操作(申请写锁)，容易会产生死锁
+//
+//  for v:= data.Iter() {
+//		data.Remove(v.Key) // 尝试删除元素申请分片Lock,但是Iter内部的迭代协程对分片做了RLock，导致死锁
+//  }
+//
 func (m *IntFdInfo) Iter() <-chan TupleIntFdInfo {
 	ch := make(chan TupleIntFdInfo)
 	go func() {
+		// Foreach shard.
 		for _, shard := range m.shardedList {
 			shard.RLock()
+			// Foreach key, value pair.
 			for key, val := range shard.items {
 				ch <- TupleIntFdInfo{key, val}
 			}
@@ -278,7 +352,7 @@ func (m *IntFdInfo) Iter() <-chan TupleIntFdInfo {
 	return ch
 }
 
-// IterBuffered Returns a buffered iterator which could be used in a for range loop.
+// IterBuffered 迭代当前容器内所有元素，使用有缓冲chan，缓冲区大小等于容器大小,迭代过程中操作容器是安全的
 func (m *IntFdInfo) IterBuffered() <-chan TupleIntFdInfo {
 	ch := make(chan TupleIntFdInfo, m.Count())
 	go func() {
